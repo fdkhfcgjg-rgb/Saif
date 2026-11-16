@@ -15,6 +15,7 @@ if _os.path.exists(_env_path):
 import os
 import json
 import asyncio
+import random
 import logging
 from telegram import Update
 from telegram.ext import (
@@ -44,7 +45,7 @@ from app_2 import build_ob55_online_auth, create_auth_token_chat, JoinSq_origina
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # توكن تليجرام المحدد
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8494653382:AAFUh3M5d078c9_SBh9W-r2SxGSDfaKgS_0")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 if not TELEGRAM_BOT_TOKEN:
     raise SystemExit("حط توكن البوت في متغير البيئة TELEGRAM_BOT_TOKEN")
 
@@ -52,8 +53,35 @@ from accounts import pool
 import ui
 import messages
 
+# فيديو الترحيب الذي يظهر قبل قائمة الأوامر عند إرسال /start.
+HELP_VIDEO_URL = "https://files.catbox.moe/qjktwg.mp4"
+INFO_VIDEO_URLS = [
+    "https://files.catbox.moe/63asg2.mp4",
+    "https://files.catbox.moe/qjktwg.mp4",
+    "https://files.catbox.moe/0ugm65.mp4",
+    "https://files.catbox.moe/vfgl4q.mp4",
+    "https://files.catbox.moe/ga1jcv.mp4",
+]
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ui.reply(update.message, ui.menu())
+    message = update.effective_message
+    if not message:
+        return
+
+    # فيديو عشوائي ولوحة الأوامر في رسالة واحدة، مثل المثال المرسل.
+    info_video_url = random.choice(INFO_VIDEO_URLS)
+    try:
+        await message.reply_video(
+            video=info_video_url,
+            caption=ui.menu(),
+            parse_mode="HTML",
+            supports_streaming=True,
+        )
+    except Exception as ex:
+        logging.warning("تعذر إرسال فيديو /start: %s", ex)
+        # إذا تعذّر إرسال الفيديو، نعرض لوحة الأوامر وحدها.
+        await ui.reply(message, ui.menu())
 
 
 # ═══════════════════════════ بوت الفريق: موسيقى + أوامر داخل اللعبة ═══════════════════════════
