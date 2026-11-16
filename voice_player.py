@@ -15,11 +15,17 @@ import os
 import json
 import random
 import shutil
+import subprocess
 import sys
 
 from proto import HELLXdecode_proto, HELLXenc_varint, HELLXcreate_proto
 
+_VOICE_DEBUG = os.environ.get("VOICE_DEBUG") == "1"
+
 def HELLXlog(tag, message):
+    # نخفي سيل حزم الصوت عشان ما يغطي على الأخطاء الحقيقية (VOICE_DEBUG=1 لإظهارها)
+    if tag == "VOICE" and not _VOICE_DEBUG and str(message).startswith(("TCP RX", "UDP RX", "UDP: Frame")):
+        return
     print(f"{tag} = > {message}")
 
 import struct as _struct
@@ -213,6 +219,57 @@ def HELLXbuild_voice_redirect(uid: str, region_id: int, region_prefix: str = "EU
 
 def _yt_dlp_command():
     return [sys.executable, "-m", "yt_dlp"]
+
+
+def _yt_cookies_file():
+    """كوكيز يوتيوب (اختياري): من متغير YT_COOKIES (نص ملف cookies.txt) أو YT_COOKIES_FILE"""
+    path = os.environ.get("YT_COOKIES_FILE")
+    if path and os.path.exists(path):
+        return path
+    text = os.environ.get("YT_COOKIES")
+    if text:
+        import tempfile
+        p = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(text.replace("\\n", "\n"))
+            return p
+        except Exception:
+            return None
+    return None
+
+def _run_ytdlp(url, raw_path, ffmpeg_path):
+    """ينزّل الصوت بـ yt-dlp. عند الفشل يسجل السبب الحقيقي ويرمي رسالة مفهومة"""
+    cmd = [*_yt_dlp_command(), "-x", "--audio-format", "wav", "--audio-quality", "0",
+           "--ffmpeg-location", ffmpeg_path, "-o", raw_path + ".%(ext)s", "--no-playlist"]
+    cookies = _yt_cookies_file()
+    if cookies:
+        cmd += ["--cookies", cookies]
+    proxy = os.environ.get("YT_PROXY")
+    if proxy:
+        cmd += ["--proxy", proxy]
+    # يوتيوب يحتاج JS runtime (deno أو node أو bun) لفك التوقيع
+    for rt in ("deno", "node", "bun"):
+        p = shutil.which(rt)
+        if not p:
+            cand = os.path.join(os.path.dirname(sys.executable), rt)
+            p = cand if os.path.exists(cand) else None
+        if p:
+            cmd += ["--js-runtimes", f"{rt}:{p}"]
+    cmd.append(url)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        HELLXlog("YTDLP", f"exit={r.returncode} stderr={err[-1200:]}")
+        low = err.lower()
+        if "not a bot" in low or "sign in to confirm" in low:
+            raise RuntimeError("يوتيوب حاظر سيرفر الاستضافة (يحتاج كوكيز)")
+        if "javascript runtime" in low or "js runtime" in low:
+            raise RuntimeError("يوتيوب يحتاج JS runtime (node/deno)")
+        if "private" in low or "unavailable" in low:
+            raise RuntimeError("الفيديو غير متاح")
+        last = err.splitlines()[-1] if err else "unknown error"
+        raise RuntimeError(last[-70:])
 
 def _ffmpeg_executable():
     executable = shutil.which("ffmpeg")
@@ -813,12 +870,12 @@ class VoicePlayer:
         if self._lyrics_task and not self._lyrics_task.done():
             self._lyrics_task.cancel()
         if not self._voice_ip or not self._voice_port:
-            await self._send_chat_message("[27EBF5]Voice connection is still starting, please wait...")
+            await self._send_chat_message("[27EBF5]⏳ جاري الاتصال بالصوت... انتظر")
             deadline = asyncio.get_running_loop().time() + 20.0
             while (not self._voice_ip or not self._voice_port) and asyncio.get_running_loop().time() < deadline:
                 await asyncio.sleep(0.25)
             if not self._voice_ip or not self._voice_port:
-                await self._send_chat_message("[F52727]Voice connection failed or timed out.")
+                await self._send_chat_message("[F52727]❌ فشل الاتصال بالصوت، جرب !play مرة ثانية")
                 return
         wav_path = _tmp.mktemp(suffix='.wav')
         ogg_path = _tmp.mktemp(suffix='.opus')
@@ -827,14 +884,7 @@ class VoicePlayer:
             import glob as _glob
             raw_path = _tmp.mktemp()
             ffmpeg_path = _ffmpeg_executable()
-            subprocess.run([
-                *_yt_dlp_command(), "-x",
-                "--audio-format", "wav",
-                "--audio-quality", "0",
-                "--ffmpeg-location", ffmpeg_path,
-                "-o", raw_path + ".%(ext)s",
-                "--no-playlist", url
-            ], check=True, capture_output=True, text=True)
+            _run_ytdlp(url, raw_path, ffmpeg_path)
             matches = _glob.glob(raw_path + ".*")
             if not matches:
                 raise Exception("yt-dlp produced no output file")
@@ -909,7 +959,7 @@ class VoicePlayer:
             try:
                 ogg_data = await encode_fut
             except Exception as e:
-                await self._send_chat_message(f"[F52727]Download failed: {str(e)[:60]}")
+                await self._send_chat_message(f"[F52727]❌ فشل التحميل: {str(e)[:60]}")
                 return
             self._lyrics_data = await lyrics_fut
             if self._lyrics_data:
@@ -920,11 +970,11 @@ class VoicePlayer:
             try:
                 ogg_data = await loop.run_in_executor(None, _encode)
             except Exception as e:
-                await self._send_chat_message(f"[F52727]Download failed: {str(e)[:60]}")
+                await self._send_chat_message(f"[F52727]❌ فشل التحميل: {str(e)[:60]}")
                 return
             self._lyrics_data = []
         await self._send_chat_message(
-            f"[27EBF5]Now Playing\n"
+            f"[00FF7F]▶ يشتغل الآن\n"
             f"[5427F5]{self._track_title[:45]}\n"
             f"[A627F5]{self._track_channel[:30]}"
         )

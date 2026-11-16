@@ -6,13 +6,10 @@ requests
 psutil
 PyJWT
 protobuf-decoder
-urllib3
 cfonts
 httpx
 google_play_scraper
 flask
 python-telegram-bot
-httpx
-pycryptodome
-yt-dlp
+yt-dlp[default]
 imageio-ffmpeg

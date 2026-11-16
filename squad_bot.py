@@ -13,13 +13,44 @@ import os
 import struct
 import time
 
+import messages as M
 from proto import HELLXdecode_proto
 from chat_proto import HELLXbuild_auth_startup, HELLXbuild_chat_auth, HELLXbuild_chat_message
 from voice_player import VoicePlayer
 from app_2 import build_ob55_online_auth, JoinSq_original, MahirAccepted
-from xC4 import Emote_k, ExiT
+from xC4 import Emote_k, ExiT, OpEnSq, cHSq, SEnd_InV, xSEndMsg
+try:
+    from Pb2 import DEcwHisPErMsG_pb2
+except Exception:          # ما نوقف البوت لو الملف ناقص
+    DEcwHisPErMsG_pb2 = None
 
 log = logging.getLogger("squad_bot")
+
+ALONE_GRACE = int(os.environ.get("ALONE_GRACE_SECONDS", "45"))                                              # ثواني بعد ما يصير وحده قبل ما يطلع
+WATCH_EVERY = 10
+IDLE_LEAVE = int(os.environ.get("IDLE_LEAVE_MINUTES", "20")) * 60   # 0 = إيقاف الخروج عند الخمول
+
+
+def _walk_ints(o, out):
+    if isinstance(o, dict):
+        for v in o.values():
+            _walk_ints(v, out)
+    elif isinstance(o, list):
+        for v in o:
+            _walk_ints(v, out)
+    elif isinstance(o, int) and not isinstance(o, bool):
+        out.append(o)
+
+
+def _looks_like_uid(n):
+    # أيدي لاعب: 9-11 خانة، نستبعد التوقيتات وأيديات الرقصات
+    if not (100_000_000 <= n <= 99_999_999_999):
+        return False
+    if 1_500_000_000 <= n <= 2_100_000_000:
+        return False
+    if 900_000_000 <= n <= 910_000_000:
+        return False
+    return True
 
 EMOTE_DELAY = 4.0
 
@@ -36,16 +67,21 @@ EVO_MAP = {
 }
 
 HELP_TEXT = (
-    "[FF69B4]✨ Welcome back ✨\n"
-    "[00FFFF]━━ Commands ━━\n"
-    "[FFD700]!play {url / اسم أغنية}\n"
-    "[FFD700]!search {كلمات} , !next , !previous , !select {n}\n"
-    "[00FF7F]!stop , !resume , !status\n"
-    "[00FF7F]!sound {1-200}  ← مستوى الصوت\n"
-    "[FF8C00]!dance {اسم/ايدي} [uid]  ← رقصة وحدة\n"
-    "[FF8C00]!em [uid ...]  ← كل الرقصات\n"
+    "[FF69B4]🎵 أوامر الموسيقى 🎵\n"
+    "[FFD700]!play اسم أغنية  ← بحث وتشغيل\n"
+    "[FFD700]!play رابط  ← تشغيل من رابط\n"
+    "[FFD700]!search كلمات  ← عرض نتائج البحث\n"
+    "[FFFFFF]!next / !previous  ← تنقل بين النتائج\n"
+    "[FFFFFF]!select رقم  ← تشغيل نتيجة\n"
+    "[00FF7F]!stop  ← إيقاف مؤقت\n"
+    "[00FF7F]!resume  ← متابعة\n"
+    "[00FF7F]!status  ← الأغنية الحالية\n"
+    "[00FF7F]!sound 1-200  ← مستوى الصوت\n"
+    "[FF8C00]!dance اسم/رقم  ← رقصة\n"
+    "[FF8C00]!em  ← كل الرقصات\n"
     "[FF8C00]!evo_list  ← أسماء الرقصات\n"
-    "[FF4500]!leave  ← يطلع البوت"
+    "[FF8C00]!5 / !3 / !6  ← ينشئ فريق ويدعوك"
+    "[FF4500]!leave  ← خروج البوت"
 )
 
 EVO_LIST_TEXT = (
@@ -60,6 +96,23 @@ EVO_LIST_TEXT = (
     "heart , love 909000045 , laugh , lol 909000002\n"
     "[00FFFF]!dance {name or id} [uid]"
 )
+
+
+def _load_emote_maps():
+    """يرجع (إيفو: رقم->ايدي, عادية: رقم نص->ايدي) من emotes.json و singele_emote.json"""
+    base = os.path.dirname(os.path.abspath(__file__))
+    evo, single = {}, {}
+    try:
+        with open(os.path.join(base, "emotes.json"), "r", encoding="utf-8") as f:
+            evo = {int(i["Number"]): int(i["Id"]) for i in json.load(f)}
+    except Exception as e:
+        log.warning("emotes.json: %s", e)
+    try:
+        with open(os.path.join(base, "singele_emote.json"), "r", encoding="utf-8") as f:
+            single = {str(i["Number"]): int(i["Id"]) for i in json.load(f)}
+    except Exception as e:
+        log.warning("singele_emote.json: %s", e)
+    return evo, single
 
 
 def _fmt(sec):
@@ -119,6 +172,9 @@ class SquadBot:
         self.online_r = self.online_w = None
         self.chat_r = self.chat_w = None
         self._chat_buf = bytearray()
+        self._chat_read_task = None
+        self._chat_keep_task = None
+        self._chat_ts = 0.0
         self._online_buf = bytearray()
         self._tasks = []
         self.closed = False
@@ -132,6 +188,13 @@ class SquadBot:
 
         self.voice = None
         self._search_results = []
+        self.command_hook = None          # للبوت الصديق: async fn(bot, cmd, args, sender_uid, private) -> True إذا عالج الأمر
+        self.quiet = False                # جلسة سريعة (من تيليجرام): بدون ترحيب ولا صوت
+        self._others = {}                # لاعبين انكشفوا بالفريق: uid -> آخر مرة انشافوا
+        self._roster_sigs = set()        # أشكال الحزم اللي تحمل قائمة الأعضاء (يتعلمها البوت)
+        self._alone_since = None
+        self._last_activity = time.time()
+        self._watch_task = None
         self._search_query = ""
         self._search_page = 0
         self._em_task = None
@@ -150,8 +213,9 @@ class SquadBot:
         self.chat_w.write(bytes.fromhex(
             HELLXbuild_auth_startup(self.uid, self.token, self.ts, self.key, self.iv)))
         await self.chat_w.drain()
-        self._spawn(self._chat_read_loop())
-        self._spawn(self._keepalive(self.chat_w))
+        self._chat_read_task = self._spawn(self._chat_read_loop())
+        self._chat_keep_task = self._spawn(self._keepalive(self.chat_w))
+        self._chat_ts = time.time()
         await asyncio.sleep(1)
 
         # الأونلاين (OB55)
@@ -180,6 +244,28 @@ class SquadBot:
             pass
 
     # ───────────── الانضمام ─────────────
+    async def _reconnect_chat(self):
+        """يفتح اتصال شات جديد (لو القديم صار خامل ما يستقبل ولا يرسل)"""
+        r = self.login
+        for t in (self._chat_read_task, self._chat_keep_task):
+            if t and not t.done():
+                t.cancel()
+        try:
+            self.chat_w.close()
+        except Exception:
+            pass
+        self.chat_r, self.chat_w = await asyncio.wait_for(
+            asyncio.open_connection(r["chat_ip"], int(r["chat_port"])), 10)
+        self._chat_buf = bytearray()
+        self.chat_w.write(bytes.fromhex(
+            HELLXbuild_auth_startup(self.uid, self.token, self.ts, self.key, self.iv)))
+        await self.chat_w.drain()
+        self._chat_read_task = self._spawn(self._chat_read_loop())
+        self._chat_keep_task = self._spawn(self._keepalive(self.chat_w))
+        self._chat_ts = time.time()
+        await asyncio.sleep(1)
+        log.info("chat reconnected")
+
     async def join(self, team_code, timeout=12):
         self._joined.clear()
         self.online_w.write(await JoinSq_original(str(team_code), self.key, self.iv))
@@ -188,6 +274,8 @@ class SquadBot:
             await asyncio.wait_for(self._joined.wait(), timeout)
             return True
         except asyncio.TimeoutError:
+            log.warning("join team %s timed out (bot %s, online_closing=%s)", team_code, self.uid,
+                        self.online_w.transport.is_closing() if self.online_w else None)
             return False
 
     async def _on_joined(self, f5):
@@ -198,23 +286,37 @@ class SquadBot:
             self.owner_uid = int(f5.get("1", self.uid))
         except Exception:
             self.owner_uid = self.uid
+        self._others = {}
+        self._alone_since = None
+        self._last_activity = time.time()
+        if self.owner_uid and self.owner_uid != self.uid:
+            self._others[self.owner_uid] = time.time()
+        if not self.quiet and (not self._watch_task or self._watch_task.done()):
+            self._watch_task = self._spawn(self._watch_loop())
         self._joined.set()
         if self.on_joined:
             try:
                 self.on_joined()
             except Exception:
                 pass
+        if not self.quiet and time.time() - self._chat_ts > 300:
+            try:
+                await self._reconnect_chat()          # الشات الخامل ممكن ما يوصله شي، نجدده
+            except Exception as e:
+                log.warning("chat reconnect failed: %s", e)
         try:
             self.chat_w.write(HELLXbuild_chat_auth(self.owner_uid, str(self.chat_region_id), self.key, self.iv))
             await self.chat_w.drain()
         except Exception as e:
             log.warning("chat auth failed: %s", e)
+        if self.quiet:
+            return
         if self.voice:
             self.voice.stop()
             self.voice.voice_region_id = None
             self.voice.start(self.voice_region_id)
         await asyncio.sleep(1.5)
-        await self.say(HELP_TEXT)
+        await self.say(M.t("help"))
 
     async def leave(self):
         try:
@@ -225,6 +327,10 @@ class SquadBot:
         self._reset_team()
 
     def _reset_team(self):
+        if self._watch_task and not self._watch_task.done() and self._watch_task is not asyncio.current_task():
+            self._watch_task.cancel()
+        self._watch_task = None
+        self._alone_since = None
         if self._em_task and not self._em_task.done():
             self._em_task.cancel()
         if self.voice:
@@ -258,6 +364,8 @@ class SquadBot:
                 data = await self.chat_r.read(16384)
                 if not data:
                     break
+                if data.hex().startswith("120000"):
+                    asyncio.create_task(self._on_whisper(data))      # رسالة خاصة
                 self._chat_buf.extend(data)
                 await self._drain_frames(self._chat_buf, self._on_chat_packet)
         except asyncio.CancelledError:
@@ -301,9 +409,99 @@ class SquadBot:
                 log.info("invite accepted code=%s", code)
             except Exception as e:
                 log.warning("accept invite failed: %s", e)
+        # متابعة الأعضاء (للخروج إذا بقى وحده)
+        if self.in_team:
+            self._track_roster(f5)
+            if os.environ.get("DEBUG_TEAM"):
+                log.info("TEAMPKT keys=%s others=%s alone_since=%s f5=%.700s", sorted(map(str, f5.keys())),
+                         sorted(self._others), self._alone_since, json.dumps(f5, ensure_ascii=False, default=str))
         # انضممنا لفريق
         if not self.voice_region_id and f5.get("17"):
             await self._on_joined(f5)
+
+    def _track_roster(self, f5):
+        """يلتقط أيديات اللاعبين من حزم الفريق. يتعلم أي حزم تحمل القائمة، وإذا وحدة منها ما فيها أحد غيره = وحده"""
+        nums = []
+        _walk_ints(f5, nums)
+        others = {n for n in nums if _looks_like_uid(n) and n != self.uid}
+        sig = tuple(sorted(str(k) for k in f5.keys()))
+        now = time.time()
+        if others:
+            for n in others:
+                self._others[n] = now
+            self._roster_sigs.add(sig)
+            self._alone_since = None
+            self._last_activity = now
+        elif sig in self._roster_sigs and self._alone_since is None:
+            self._alone_since = now
+            log.info("team roster has no one else (alone?) sig=%s", sig)
+
+    def _is_playing(self):
+        try:
+            t = self.voice._udp_task
+            return bool(t and not t.done())
+        except Exception:
+            return False
+
+    async def _leave_team(self, reason):
+        log.info("leaving team (%s)", reason)
+        if self.persistent:
+            await self.leave()
+        else:
+            await self.close()
+
+    async def _watch_loop(self):
+        """يطلع من الفريق إذا بقى وحده، أو إذا ما صار أي نشاط مدة طويلة"""
+        try:
+            while not self.closed and self.in_team:
+                await asyncio.sleep(WATCH_EVERY)
+                now = time.time()
+                if self._alone_since and now - self._alone_since >= ALONE_GRACE:
+                    await self._leave_team("alone")
+                    return
+                if IDLE_LEAVE and now - self._last_activity >= IDLE_LEAVE and not self._is_playing():
+                    await self.say(M.t("idle_leave"))
+                    await self._leave_team("idle")
+                    return
+        except asyncio.CancelledError:
+            return
+
+    async def _private_reply(self, uid, text):
+        try:
+            pkt = await xSEndMsg(text, 2, int(uid), int(uid), self.key, self.iv)
+            self.chat_w.write(pkt)
+            await self.chat_w.drain()
+        except Exception as e:
+            log.warning("private reply failed: %s", e)
+
+    async def _on_whisper(self, data):
+        """رسائل الخاص: نرد على /help و /3 /5 /6"""
+        if DEcwHisPErMsG_pb2 is None:
+            return
+        try:
+            proto = DEcwHisPErMsG_pb2.DecodeWhisper()
+            proto.ParseFromString(bytes.fromhex(data.hex()[10:]))
+            uid, ctype, msg = proto.Data.uid, proto.Data.chat_type, proto.Data.msg.strip()
+        except Exception:
+            return
+        if ctype in (0, 1) or not msg or str(uid) == str(self.uid):     # 0 فريق، 1 قبيلة: نتجاهلهم هنا
+            return
+        log.info("private [%s]: %s", uid, msg)
+        cmd = msg.lower().split()[0]
+        if cmd[:1] in ("/", "!"):
+            cmd = cmd[1:]
+        if self.command_hook:
+            try:
+                if await self.command_hook(self, cmd, msg.split()[1:], uid, True):
+                    return
+            except Exception as e:
+                log.warning("command hook error (private): %s", e)
+        if cmd in ("3", "5", "6"):
+            await self._private_reply(uid, f"[B][C][00FFFF]جاري إنشاء فريق {cmd} لاعبين...")
+            ok, text = await self.make_team(int(cmd), int(uid))
+            await self._private_reply(uid, ("[B][C][00FF7F]" if ok else "[B][C][FF0000]") + text)
+        else:
+            await self._private_reply(uid, M.t("private_help"))
 
     async def _on_chat_packet(self, pd):
         f5 = pd.get("5")
@@ -321,11 +519,16 @@ class SquadBot:
         if isinstance(f9, dict):
             name = str(f9.get("1", ""))
         log.info("[%s|%s]: %s", name, sender, message)
+        if sender.isdigit():
+            self._others[int(sender)] = time.time()
+        self._alone_since = None
+        self._last_activity = time.time()
         asyncio.create_task(self.handle_command(message.strip(), sender))
 
     # ───────────── الإرسال ─────────────
     async def say(self, message):
         if not self.chat_w or self.chat_w.transport.is_closing():
+            log.warning("say(): chat connection is closed, message dropped")
             return
         try:
             owner = self.owner_uid or self.uid
@@ -346,52 +549,64 @@ class SquadBot:
         parts = msg.split()
         cmd = parts[0].lower()
         args = parts[1:]
+        if self.command_hook:
+            try:
+                if await self.command_hook(self, cmd[1:], args, sender_uid, False):
+                    return
+            except Exception as e:
+                log.warning("command hook error: %s", e)
         try:
             if cmd == "!help":
-                await self.say(HELP_TEXT)
+                await self.say(M.t("help"))
             elif cmd == "!play":
                 if not args:
-                    await self.say("[FF0000]Usage: !play [url / اسم أغنية]")
+                    await self.say(M.t("play_usage"))
                     return
                 if args[-1].lower() in ("on", "off"):
                     args = args[:-1]
                 await self._play_query(" ".join(args))
+            elif cmd in ("!3", "!5", "!6"):
+                if not sender_uid or not str(sender_uid).isdigit():
+                    await self.say(M.t("no_id"))
+                    return
+                await self.say(M.t("team_creating", size=cmd[1:]))
+                await self.make_team(int(cmd[1:]), int(sender_uid))
             elif cmd == "!search":
                 if not args:
-                    await self.say("[FF0000]Usage: !search [كلمات]")
+                    await self.say(M.t("usage_search"))
                     return
                 await self._do_search(" ".join(args))
             elif cmd == "!next":
                 if not self._search_results:
-                    await self.say("[FF0000]No search results. Use !search first.")
+                    await self.say(M.t("no_results_yet"))
                 elif self._search_page >= len(self._search_results) - 1:
-                    await self.say("[00FFFF]آخر نتيجة.")
+                    await self.say(M.t("last_result"))
                 else:
                     self._search_page += 1
                     await self._show_search_page()
             elif cmd in ("!previous", "!prev"):
                 if not self._search_results:
-                    await self.say("[FF0000]No search results. Use !search first.")
+                    await self.say(M.t("no_results_yet"))
                 elif self._search_page <= 0:
-                    await self.say("[FF0000]أول نتيجة.")
+                    await self.say(M.t("first_result"))
                 else:
                     self._search_page -= 1
                     await self._show_search_page()
             elif cmd == "!select":
                 if not args or not args[0].isdigit():
-                    await self.say("[FF0000]Usage: !select [number]")
+                    await self.say(M.t("usage_select"))
                     return
                 idx = int(args[0]) - 1
                 if not self._search_results or not (0 <= idx < len(self._search_results)):
-                    await self.say("[FF0000]Invalid selection.")
+                    await self.say(M.t("invalid_selection"))
                     return
                 await self._play_item(self._search_results[idx])
             elif cmd == "!sound":
                 if not args or not args[0].isdigit() or not (1 <= int(args[0]) <= 200):
-                    await self.say("[FF0000]Usage: !sound [1-200]")
+                    await self.say(M.t("usage_sound"))
                     return
                 self.voice._volume = int(args[0])
-                await self.say(f"[00FFFF]Volume {args[0]}%\n[FFD700]يتغير مع الأغنية الجاية.")
+                await self.say(M.t("volume", volume=args[0]))
             elif cmd == "!stop":
                 await self._stop()
             elif cmd == "!resume":
@@ -405,7 +620,7 @@ class SquadBot:
             elif cmd == "!em":
                 await self._start_em(args, sender_uid)
             elif cmd == "!leave":
-                await self.say("[FF4500]⏹ Bye! 👋")
+                await self.say(M.t("bye"))
                 await asyncio.sleep(1)
                 if self.persistent:
                     await self.leave()
@@ -413,15 +628,15 @@ class SquadBot:
                     await self.close()
         except Exception as e:
             log.warning("command error [%s]: %s", message[:20], e)
-            await self.say("[FF0000]صار خطأ، جرب مرة ثانية.")
+            await self.say(M.t("error_generic"))
 
     # ── موسيقى ──
     async def _play_query(self, query):
         loop = asyncio.get_running_loop()
-        await self.say(f"[00FFFF]🔎 {query[:40]}")
+        await self.say(M.t("searching", query=query[:40]))
         results = await loop.run_in_executor(None, _ytdl_search, query, 1)
         if not results:
-            await self.say("[FF0000]❌ ما لقيت الأغنية")
+            await self.say(M.t("not_found"))
             return
         await self._play_item(results[0])
 
@@ -429,7 +644,7 @@ class SquadBot:
         v = self.voice
         v._track_title = item["title"]
         v._track_channel = item.get("channel", "")
-        await self.say(f"[00FFFF]⏳ {item['title'][:50]}\n[FFFFFF]{item['url']}")
+        await self.say(M.t("found_loading", title=item["title"][:50]))
         asyncio.create_task(self._play_voice(item["url"]))
 
     async def _play_voice(self, url):
@@ -439,7 +654,7 @@ class SquadBot:
             pass
         except Exception as e:
             log.warning("voice play failed: %s", e)
-            await self.say("[FF0000]❌ تعذر تشغيل الصوت")
+            await self.say(M.t("play_failed"))
 
     async def _do_search(self, query):
         loop = asyncio.get_running_loop()
@@ -447,17 +662,15 @@ class SquadBot:
         self._search_results = await loop.run_in_executor(None, _ytdl_search, query, 10)
         self._search_page = 0
         if not self._search_results:
-            await self.say("[FF0000]ما لقيت نتائج.")
+            await self.say(M.t("search_none"))
             return
         await self._show_search_page()
 
     async def _show_search_page(self):
         i = self._search_page
         r = self._search_results[i]
-        await self.say(
-            f"[FF69B4]🔎 {i + 1}/{len(self._search_results)}\n"
-            f"[FFFFFF]{r['title'][:55]}\n[00FFFF]{r.get('channel', '')[:30]} • {_fmt(r.get('duration'))}\n"
-            f"[FFD700]!select {i + 1} للتشغيل , !next , !previous")
+        await self.say(M.t("search_page", i=i + 1, n=len(self._search_results), title=r["title"][:55],
+                           channel=r.get("channel", "")[:30], duration=_fmt(r.get("duration"))))
 
     async def _stop(self):
         v = self.voice
@@ -465,23 +678,22 @@ class SquadBot:
         if self._em_task and not self._em_task.done():
             self._em_task.cancel()
             if not playing:
-                await self.say("[FF4500]⏹ تم إيقاف الرقص.")
+                await self.say(M.t("dance_stopped"))
         if playing:
             v._udp_task.cancel()
             for t in (v._progress_task, v._lyrics_task):
                 if t and not t.done():
                     t.cancel()
             v._stopped_frame = v._track_current_frame
-            await self.say(
-                f"[FF0000]Stopped at {_fmt(v._stopped_frame * 0.02)} / {_fmt(v._track_total_frames * 0.02)}\n"
-                f"[FFD700]{v._track_title}\n[00FFFF]!resume للمتابعة")
+            await self.say(M.t("stopped", pos=_fmt(v._stopped_frame * 0.02),
+                               total=_fmt(v._track_total_frames * 0.02), title=v._track_title))
         elif not (self._em_task and not self._em_task.done()):
-            await self.say("[FF0000]ما في شي شغال.")
+            await self.say(M.t("nothing_playing"))
 
     async def _resume(self):
         v = self.voice
         if v._current_ogg and v._voice_ip:
-            await self.say(f"[00FFFF]▶ {v._track_title}")
+            await self.say(M.t("resumed", title=v._track_title))
             v._udp_task = asyncio.create_task(
                 v._voice_udp_loop(v._voice_ip, v._voice_port, ogg_data=v._current_ogg,
                                   start_frame=getattr(v, "_stopped_frame", 0)))
@@ -489,7 +701,7 @@ class SquadBot:
                 v._progress_task.cancel()
             v._progress_task = asyncio.create_task(v._auto_progress_loop())
         else:
-            await self.say("[FF0000]ما في شي أكمله.")
+            await self.say(M.t("nothing_to_resume"))
 
     async def _status(self):
         v = self.voice
@@ -503,7 +715,7 @@ class SquadBot:
                 f"{bar}\n[FFFFFF]{_fmt(v._track_current_frame * 0.02)} / {_fmt(v._track_total_frames * 0.02)}"
                 f"  [FFD700]Vol:{v._volume}%")
         else:
-            await self.say("[FFD700]ما في موسيقى. جرب !play [اسم أغنية]")
+            await self.say(M.t("no_music"))
 
     # ── رقص ──
     def _resolve_emote(self, token):
@@ -514,20 +726,20 @@ class SquadBot:
 
     async def _dance(self, args, sender_uid):
         if not args:
-            await self.say("[FF0000]Usage: !dance {name or id} [uid]")
+            await self.say(M.t("usage_dance"))
             return
         eid = self._resolve_emote(args[0])
         if eid is None:
-            await self.say(f"[FF0000]رقصة مو معروفة: {args[0]}\n[FFD700]اكتب !evo_list")
+            await self.say(M.t("dance_unknown", name=args[0]))
             return
         target = int(args[1]) if len(args) > 1 and args[1].isdigit() else int(sender_uid or self.owner_uid or self.uid)
         self.online_w.write(await Emote_k(target, eid, self.key, self.iv, self.region))
         await self.online_w.drain()
-        await self.say("[00FFFF]💃 تم إرسال الرقصة.")
+        await self.say(M.t("dance_sent"))
 
     async def _start_em(self, args, sender_uid):
         if self._em_task and not self._em_task.done():
-            await self.say("[FF0000]الرقص شغال، اكتب !stop أول.")
+            await self.say(M.t("dance_busy"))
             return
         extra = [int(a) for a in args if a.isdigit()]
         if extra:
@@ -539,9 +751,9 @@ class SquadBot:
                     targets.append(int(t))
         emotes = load_all_emote_ids()
         if not targets or not emotes:
-            await self.say("[FF0000]ما لقيت لاعبين أو رقصات.")
+            await self.say(M.t("dance_none"))
             return
-        await self.say(f"[FF69B4]💃 بيرقص {len(targets)} لاعب بـ {len(emotes)} رقصة\n[FFD700]!stop للإيقاف")
+        await self.say(M.t("dance_started", players=len(targets), count=len(emotes)))
         self._em_task = asyncio.create_task(self._em_loop(targets, emotes))
 
     async def _em_loop(self, targets, emotes):
@@ -552,13 +764,134 @@ class SquadBot:
                     await self.online_w.drain()
                     await asyncio.sleep(0.15)
                 await asyncio.sleep(EMOTE_DELAY)
-            await self.say("[00FF7F]✅ خلصت كل الرقصات.")
+            await self.say(M.t("dance_done"))
         except asyncio.CancelledError:
             pass
         except Exception as e:
             log.warning("em loop: %s", e)
 
     # ───────────── الإغلاق ─────────────
+    # ── فرق ورقصات بدون صوت (نفس أوامر STRAVEX) ──
+    async def _send_online(self, pkt):
+        self.online_w.write(pkt)
+        await self.online_w.drain()
+
+    async def make_team(self, size, target_uid):
+        """ينشئ فريق (3/5/6) ويدعو اللاعب ثم يطلع منه، ويرجع البوت متاح"""
+        key, iv, region = self.key, self.iv, self.region
+        try:
+            if size != 3:
+                await self._send_online(await ExiT(target_uid, key, iv))
+                await asyncio.sleep(0.3)
+            await self._send_online(await OpEnSq(key, iv, region))
+            await asyncio.sleep(0.3)
+            await self._send_online(await cHSq(size, target_uid, key, iv, region))
+            await asyncio.sleep(0.3)
+            await self._send_online(await SEnd_InV(size, target_uid, key, iv, region))
+            await asyncio.sleep(3.5)
+            await self._send_online(await ExiT(None, key, iv))
+            self._reset_team()
+            return True, f"تم إرسال دعوة فريق {size} لاعبين إلى {target_uid}"
+        except Exception as e:
+            log.warning("make_team failed: %s", e)
+            return False, f"خطأ: {e}"
+
+    async def _join_team_code(self, team_code, attempts=3, wait=6.0):
+        """يدخل فريق بالكود ويتأكد من الدخول (يعيد المحاولة). يرجع True/False"""
+        for i in range(attempts):
+            self._reset_team()          # نمسح حالة الفريق القديم عشان نلتقط تأكيد الدخول الجديد
+            await self._send_online(await JoinSq_original(str(team_code), self.key, self.iv))
+            try:
+                await asyncio.wait_for(self._joined.wait(), wait)
+                return True
+            except asyncio.TimeoutError:
+                log.warning("join team %s: no confirmation (attempt %d/%d)", team_code, i + 1, attempts)
+                try:
+                    await self._send_online(await ExiT(None, self.key, self.iv))
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+        return False
+
+    async def dance_uids(self, team_code, uids, number, evo=False):
+        """يدخل فريق بالكود ويرسل رقصة محددة (برقمها) للاعبين المحددين ثم يطلع"""
+        evo_map, single_map = _load_emote_maps()
+        number = str(number)
+        if evo:
+            if not number.isdigit() or int(number) not in evo_map:
+                return False, f"رقم رقصة الإيفو '{number}' غير موجود"
+            emote_id = evo_map[int(number)]
+        else:
+            if number not in single_map:
+                return False, f"رقم الرقصة '{number}' غير موجود"
+            emote_id = single_map[number]
+        key, iv, region = self.key, self.iv, self.region
+        try:
+            if not await self._join_team_code(team_code):
+                return False, "ما قدرت أنضم للفريق، تأكد من الكود وإن الفريق مفتوح"
+            await asyncio.sleep(0.7)
+            sc = 0
+            for t in uids:
+                try:
+                    await self._send_online(await Emote_k(int(t), int(emote_id), key, iv, region))
+                    sc += 1
+                    await asyncio.sleep(0.15)
+                except Exception:
+                    pass
+            await asyncio.sleep(0.5)
+            await self._send_online(await ExiT(None, key, iv))
+            self._reset_team()
+            kind = "إيفو " if evo else ""
+            return True, f"تم إرسال رقصة {kind}{number} إلى {sc} لاعب في الفريق {team_code}"
+        except Exception as e:
+            log.warning("dance_uids failed: %s", e)
+            return False, f"خطأ: {e}"
+
+    async def evos_loop(self, team_code, uid, delay=4.0, on_round=None):
+        """يدخل الفريق ويرقّص اللاعب بكل الرقصات ويكررها بدون توقف لين يتلغي (task.cancel) أو ينقطع البوت"""
+        evo_map, single_map = _load_emote_maps()
+        ids, seen = [], set()
+        singles = sorted(single_map, key=lambda x: int(x) if x.isdigit() else 0)
+        for eid in [evo_map[k] for k in sorted(evo_map)] + [single_map[k] for k in singles]:
+            if eid not in seen:
+                seen.add(eid)
+                ids.append(eid)
+        if not ids:
+            return False, "ما لقيت ملفات الرقصات (emotes.json / singele_emote.json)"
+        key, iv, region = self.key, self.iv, self.region
+        if not await self._join_team_code(team_code):
+            return False, "ما قدرت أنضم للفريق، تأكد من الكود وإن الفريق مفتوح"
+        await asyncio.sleep(1.0)
+        rounds = 0
+        try:
+            while not self.closed:
+                for eid in ids:
+                    if self.closed:
+                        break
+                    try:
+                        await self._send_online(await Emote_k(int(uid), int(eid), key, iv, region))
+                    except (ConnectionError, OSError, AttributeError) as e:
+                        log.warning("evos: connection lost: %s", e)
+                        self.closed = True
+                        break
+                    except Exception as e:
+                        log.warning("evos: emote %s failed: %s", eid, e)
+                    await asyncio.sleep(delay)
+                rounds += 1
+                if on_round:
+                    try:
+                        await on_round(rounds, len(ids))
+                    except Exception:
+                        pass
+        finally:
+            try:
+                if not self.closed:
+                    await self._send_online(await ExiT(None, key, iv))
+            except Exception:
+                pass
+            self._reset_team()
+        return True, "انتهت"
+
     async def close(self):
         if self.closed:
             return

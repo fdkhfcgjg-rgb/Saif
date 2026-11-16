@@ -1,0 +1,14 @@
+{
+  "admins": [],
+  "enabled": true,
+  "allowed_groups": [
+    -1004401345904
+  ],
+  "banned_groups": [],
+  "channels": [],
+  "disabled_cmds": [],
+  "stats": {
+    "teams_joined": 0,
+    "daily": {}
+  }
+}
